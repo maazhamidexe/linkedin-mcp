@@ -1,237 +1,554 @@
-"""MCP server for LinkedIn integration."""
+"""
+LinkedIn MCP Server with FastMCP OAuth Proxy
+Uses FastMCP's OAuth Proxy for authorization code grant flow
+MCP clients register dynamically and server handles OAuth flow with LinkedIn
+"""
 import logging
-import webbrowser
-from typing import List
+import os
+import sys
+import threading
+from typing import List, Optional
 
+import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP, Context
-from pydantic import FilePath
-
-from .linkedin.auth import LinkedInOAuth, AuthError
-from .linkedin.post import PostManager, PostRequest, PostCreationError, MediaRequest, PostVisibility
-from .callback_server import LinkedInCallbackServer
+from fastmcp import FastMCP, Context
+from fastmcp.server.auth import OAuthProxy
+from fastmcp.server.dependencies import get_access_token, get_http_request
+from .linkedin.post import PostCreationError
+from .linkedin.token_verifier import LinkedInTokenVerifier
 from .utils.logging import configure_logging
 from .config.settings import settings
 
+# Load environment variables
+load_dotenv()
+
 # Configure logging
-configure_logging(
-    log_level=settings.LOG_LEVEL,
-)
+configure_logging(log_level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-# Initialize MCP server
-mcp = FastMCP(
-    "LinkedInServer",
-    dependencies=[
-        "httpx",
-        "mcp[cli]",
-        "pydantic",
-        "pydantic-settings",
-        "python-dotenv"
-    ]
+# Server configuration
+PORT = settings.SERVER_PORT
+SERVER_BASE_URL = settings.SERVER_BASE_URL
+logger.info(f"Server base URL: {SERVER_BASE_URL}")
+
+# LinkedIn API endpoints
+LINKEDIN_USERINFO_URL = str(settings.LINKEDIN_USERINFO_URL)
+LINKEDIN_POST_URL = str(settings.LINKEDIN_POST_URL)
+LINKEDIN_ASSET_REGISTER_URL = str(settings.LINKEDIN_ASSET_REGISTER_URL)
+
+# Token storage configuration
+JWT_SIGNING_KEY = settings.JWT_SIGNING_KEY.get_secret_value() if settings.JWT_SIGNING_KEY else None
+TOKEN_ENCRYPTION_KEY = settings.TOKEN_ENCRYPTION_KEY.get_secret_value() if settings.TOKEN_ENCRYPTION_KEY else None
+
+# Set up persistent storage for tokens if encryption keys are available
+storage_backend = None
+if JWT_SIGNING_KEY and TOKEN_ENCRYPTION_KEY:
+    try:
+        from key_value.aio.stores.disk import DiskStore
+        from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+        from cryptography.fernet import Fernet
+        
+        token_storage_dir = settings.OAUTH_TOKEN_STORAGE_PATH
+        os.makedirs(token_storage_dir, exist_ok=True)
+        
+        storage_backend = FernetEncryptionWrapper(
+            key_value=DiskStore(directory=token_storage_dir),
+            fernet=Fernet(TOKEN_ENCRYPTION_KEY.encode() if isinstance(TOKEN_ENCRYPTION_KEY, str) else TOKEN_ENCRYPTION_KEY)
+        )
+        logger.info(f"✅ Configured encrypted token storage at: {token_storage_dir}")
+    except ImportError:
+        logger.warning("⚠️  key-value or cryptography not installed - tokens will NOT persist across restarts")
+        storage_backend = None
+    except Exception as e:
+        logger.warning(f"⚠️  Could not configure encrypted storage: {e}")
+        storage_backend = None
+else:
+    logger.warning("⚠️  JWT_SIGNING_KEY or TOKEN_ENCRYPTION_KEY not set - tokens will NOT persist across restarts")
+
+# LinkedIn OAuth endpoints
+LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
+LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+
+# Create token verifier
+token_verifier = LinkedInTokenVerifier(required_scopes=settings.LINKEDIN_SCOPES)
+
+# Create OAuth Proxy for LinkedIn
+logger.info(f"Creating OAuth Proxy with base_url: {SERVER_BASE_URL}")
+
+auth = OAuthProxy(
+    # LinkedIn OAuth endpoints
+    upstream_authorization_endpoint=LINKEDIN_AUTH_URL,
+    upstream_token_endpoint=LINKEDIN_TOKEN_URL,
+    
+    # Your registered LinkedIn app credentials
+    upstream_client_id=settings.LINKEDIN_CLIENT_ID.get_secret_value(),
+    upstream_client_secret=settings.LINKEDIN_CLIENT_SECRET.get_secret_value(),
+    
+    # Token verification
+    token_verifier=token_verifier,
+    
+    # Your FastMCP server's public URL
+    base_url=SERVER_BASE_URL,
+    
+    # OAuth callback path (must match LinkedIn app settings)
+    redirect_path="/auth/callback",
+    
+    # LinkedIn requires client_secret_post (credentials in POST body)
+    token_endpoint_auth_method="client_secret_post",
+    
+    # Forward PKCE to LinkedIn (LinkedIn supports PKCE)
+    forward_pkce=True,
+    
+    # Allow any client redirect URI for MCP clients
+    allowed_client_redirect_uris=None,
+    
+    # Add scope to authorization request
+    extra_authorize_params={
+        "scope": " ".join(settings.LINKEDIN_SCOPES),
+    },
+    
+    # Token storage configuration
+    jwt_signing_key=JWT_SIGNING_KEY,
+    client_storage=storage_backend,
+    
+    # Skip consent screen for smoother flow
+    require_authorization_consent=False
 )
 
-# Initialize LinkedIn clients
-auth_client = LinkedInOAuth()
-post_manager = PostManager(auth_client)
+logger.info("✅ OAuth Proxy created successfully")
+logger.info(f"   Authorization endpoint: {LINKEDIN_AUTH_URL}")
+logger.info(f"   Token endpoint: {LINKEDIN_TOKEN_URL}")
+logger.info(f"   Redirect path: {SERVER_BASE_URL}/auth/callback")
+logger.info(f"   Scopes: {', '.join(settings.LINKEDIN_SCOPES)}")
+
+
+class ThreadSafeTokenHolder:
+    """
+    Thread-safe holder for access tokens.
+    Uses thread-local storage to isolate tokens between concurrent requests.
+    """
+    def __init__(self):
+        self._local = threading.local()
+        logger.debug("ThreadSafeTokenHolder initialized")
+
+    def set_token(self, token: str):
+        """Set the access token for the current thread."""
+        self._local.access_token = token
+
+    @property
+    def access_token(self) -> Optional[str]:
+        """Get the access token for the current thread."""
+        return getattr(self._local, 'access_token', None)
+
+
+# Global token holder for the current request
+token_holder = ThreadSafeTokenHolder()
+
+
+async def extract_linkedin_token() -> Optional[str]:
+    """
+    Extract the upstream LinkedIn access token from the FastMCP context.
+    
+    This function handles the token exchange from FastMCP JWT to the actual
+    LinkedIn upstream token that can be used for API calls.
+    """
+    fastmcp_token = None
+    
+    # Method 1: Try to get token from HTTP request headers
+    try:
+        http_request = get_http_request()
+        if http_request:
+            auth_header = http_request.headers.get('Authorization') or http_request.headers.get('authorization', '')
+            if auth_header and auth_header.startswith('Bearer '):
+                fastmcp_token = auth_header[7:].strip()
+                logger.debug(f"Got FastMCP token from HTTP header for thread {threading.current_thread().ident}")
+    except Exception as e:
+        logger.debug(f"Could not get token from HTTP request: {e}")
+    
+    # Method 2: Try FastMCP dependency injection
+    if not fastmcp_token:
+        try:
+            access_token_obj = get_access_token()
+            if access_token_obj:
+                if hasattr(access_token_obj, 'token'):
+                    fastmcp_token = access_token_obj.token
+                elif isinstance(access_token_obj, str):
+                    fastmcp_token = access_token_obj
+                logger.debug("Got FastMCP token from get_access_token()")
+        except Exception as e:
+            logger.debug(f"Could not get token via get_access_token(): {e}")
+    
+    # Method 3: Check thread-local storage (set by middleware)
+    if not fastmcp_token:
+        token = token_holder.access_token
+        if token:
+            logger.debug("Using token from thread-local storage")
+            return token
+    
+    # Swap FastMCP JWT for upstream LinkedIn token using OAuth Proxy
+    if fastmcp_token:
+        try:
+            upstream_token_obj = await auth.load_access_token(fastmcp_token)
+            if upstream_token_obj and hasattr(upstream_token_obj, 'token'):
+                upstream_token = upstream_token_obj.token
+                token_holder.set_token(upstream_token)
+                logger.info(f"✅ Extracted upstream LinkedIn token for thread {threading.current_thread().ident}")
+                return upstream_token
+            else:
+                logger.warning("load_access_token returned None or invalid token object")
+        except Exception as e:
+            logger.warning(f"Failed to load upstream token from FastMCP JWT: {e}")
+            # Fallback: use FastMCP token directly
+            token_holder.set_token(fastmcp_token)
+            return fastmcp_token
+    
+    logger.warning("No token found in context")
+    return None
+
+
+def get_linkedin_headers(access_token: str) -> dict:
+    """Get headers for LinkedIn API requests."""
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "X-Restli-Protocol-Version": settings.RESTLI_PROTOCOL_VERSION,
+        "LinkedIn-Version": settings.LINKEDIN_VERSION,
+        "Content-Type": "application/json"
+    }
+
+
+# Initialize MCP server with OAuth proxy
+mcp = FastMCP("LinkedInServer", auth=auth)
 
 
 @mcp.tool()
-async def authenticate(ctx: Context = None) -> str:
-    """Start LinkedIn authentication flow and handle callback automatically.
-
+async def get_profile(ctx: Context = None) -> str:
+    """Get the authenticated LinkedIn user's profile information.
+    
+    Returns profile details including name, email, and profile picture URL.
+    
     Returns:
-        Success message after authentication
+        JSON string with user profile information
     """
-    logger.info("Starting LinkedIn authentication flow...")
-    callback_server = None
-
+    logger.info("Getting LinkedIn profile...")
+    
     try:
-        # Start callback server
-        callback_server = LinkedInCallbackServer(port=3000)
-        await callback_server.start()
-
-        # Get auth URL
-        logger.debug("Getting authorization URL from LinkedIn")
-        auth_url, expected_state = await auth_client.get_authorization_url()
-        logger.debug(f"Authorization URL generated with state: {expected_state}")
-
-        if ctx:
-            ctx.info("Opening browser for authentication...")
-
-        # Open browser
-        logger.info(f"Opening browser to: {auth_url}")
-        if not webbrowser.open(auth_url):
-            error_msg = "Failed to open browser. Please visit the URL manually: " + auth_url
-            logger.error(error_msg)
-            if ctx:
-                ctx.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        logger.info("Waiting for authentication callback...")
-        if ctx:
-            ctx.info("Waiting for authentication callback...")
-
-        # Add debug info for event status
-        logger.debug(f"Auth received event status before wait: {callback_server.auth_received.is_set()}")
-
-        try:
-            import asyncio
-            logger.debug("Current event loop: %s", asyncio.get_running_loop())
-        except RuntimeError as e:
-            logger.warning(f"Error getting event loop: {str(e)}")
-
-        # Wait for callback with detailed error handling
-        logger.debug("Calling wait_for_callback with 120 second timeout")
-        code, state = await callback_server.wait_for_callback(timeout=120)  # Reduced timeout for better user experience
-
-        logger.debug(f"Auth received event status after wait: {callback_server.auth_received.is_set()}")
-        logger.debug(f"Callback result received: code={code is not None}, state={state is not None}")
-
-        # Check code and state, providing detailed log messages
-        if not code:
-            logger.error("No authorization code received from callback")
-            raise AuthError("Authentication failed - no authorization code received")
-
-        if not state:
-            logger.error("No state parameter received from callback")
-            raise AuthError("Authentication failed - no state parameter received")
-
-        if state != expected_state:
-            logger.error(f"State mismatch. Expected: {expected_state}, Got: {state}")
-            raise AuthError(f"Invalid state parameter: expected {expected_state}, got {state}")
-
-        logger.debug(f"State parameter matches expected value: {state}")
-
-        if ctx:
-            ctx.info("Exchanging authorization code for tokens...")
-
-        # Exchange code for tokens
-        logger.info("Exchanging authorization code for tokens")
-        tokens = await auth_client.exchange_code(code)
-        if not tokens:
-            logger.error("Failed to exchange code for tokens")
-            raise AuthError("Failed to exchange authorization code for tokens")
-
-        logger.debug("Successfully obtained tokens from authorization code")
-
-        if ctx:
-            ctx.info("Getting user info...")
-
-        # Get and save user info
-        logger.info("Getting user info & saving tokens...")
-        user_info = await auth_client.get_user_info()
-        logger.debug(f"User info retrieved: {user_info.sub}")
-
-        auth_client.save_tokens(user_info.sub)
-        logger.info("Tokens saved successfully")
-
-        success_msg = f"Successfully authenticated with LinkedIn as {user_info.name}!"
-        logger.info(success_msg)
-        return success_msg
-
-    except AuthError as e:
-        error_msg = f"Authentication error: {str(e)}"
+        # Extract LinkedIn token from OAuth proxy
+        access_token = await extract_linkedin_token()
+        if not access_token:
+            raise RuntimeError(
+                "Not authenticated. Please complete the OAuth flow first. "
+                "Your MCP client should prompt you to authenticate."
+            )
+        
+        # Make request to LinkedIn userinfo endpoint
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                LINKEDIN_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            
+            if response.status_code == 401:
+                raise RuntimeError(
+                    "Authentication expired. Please re-authenticate via OAuth flow."
+                )
+            
+            response.raise_for_status()
+            user_data = response.json()
+            
+            logger.info(f"Successfully retrieved profile for: {user_data.get('name', 'unknown')}")
+            
+            # Return formatted profile information
+            return f"""LinkedIn Profile:
+- Name: {user_data.get('name', 'N/A')}
+- Given Name: {user_data.get('given_name', 'N/A')}
+- Family Name: {user_data.get('family_name', 'N/A')}
+- Email: {user_data.get('email', 'N/A')}
+- Email Verified: {user_data.get('email_verified', 'N/A')}
+- User ID (sub): {user_data.get('sub', 'N/A')}
+- Picture URL: {user_data.get('picture', 'N/A')}"""
+    
+    except httpx.HTTPStatusError as e:
+        error_msg = f"HTTP error getting profile: {e.response.status_code}"
         logger.error(error_msg)
-        if ctx:
-            ctx.error(error_msg)
         raise RuntimeError(error_msg)
     except Exception as e:
-        error_msg = f"Authentication failed: {str(e)}"
-        logger.exception("Unexpected error during authentication")
-        if ctx:
-            ctx.error(error_msg)
+        error_msg = f"Failed to get profile: {str(e)}"
+        logger.exception(error_msg)
         raise RuntimeError(error_msg)
-    finally:
-        # Ensure server is stopped
-        if callback_server:
-            logger.debug("Stopping callback server in finally block")
-            callback_server.stop()
 
 
 @mcp.tool()
 async def create_post(
-        text: str,
-        media_files: List[FilePath] = None,
-        media_titles: List[str] = None,
-        media_descriptions: List[str] = None,
-        visibility: PostVisibility = "PUBLIC",
-        ctx: Context = None
+    text: str,
+    visibility: str = "PUBLIC",
+    ctx: Context = None
 ) -> str:
-    """Create a new post on LinkedIn.
+    """Create a new text post on LinkedIn.
+    
+    This tool creates a simple text post. For posts with media attachments,
+    use create_post_with_media instead.
 
     Args:
-        text: The content of your post
-        media_files: List of paths to media files to attach (images or videos)
-        media_titles: Optional titles for media attachments
-        media_descriptions: Optional descriptions for media attachments
-        visibility: Post visibility (PUBLIC or CONNECTIONS)
-        ctx: MCP Context for progress reporting
+        text: The content of your post (required)
+        visibility: Post visibility - "PUBLIC" or "CONNECTIONS" (default: PUBLIC)
 
     Returns:
         Success message with post ID
     """
     logger.info("Creating LinkedIn post...")
+    
     try:
-        if ctx:
-            ctx.info(f"Creating LinkedIn post with visibility: {visibility}")
-
-        if not auth_client.is_authenticated:
-            error_msg = "Not authenticated. Please authenticate first."
-            logger.error(error_msg)
-            if ctx:
-                ctx.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        # Prepare media requests if files are provided
-        media_requests = None
-        if media_files:
-            media_requests = []
-            for i, file_path in enumerate(media_files):
-                title = media_titles[i] if media_titles and i < len(media_titles) else None
-                description = media_descriptions[i] if media_descriptions and i < len(media_descriptions) else None
-
-                logger.debug(f"Processing media file: {file_path}, title: {title}")
-                if ctx:
-                    ctx.info(f"Processing media file: {file_path}, title: {title}")
-
-                media_requests.append(MediaRequest(
-                    file_path=file_path,
-                    title=title,
-                    description=description
-                ))
-
-        # Create post request
-        post_request = PostRequest(
-            text=text,
-            visibility=visibility,
-            media=media_requests
-        )
-
-        # Create the post
-        logger.info("Sending post to LinkedIn API")
-        post_id = await post_manager.create_post(post_request)
-        success_msg = f"Successfully created LinkedIn post with ID: {post_id}"
-        logger.info(success_msg)
-
-        return success_msg
-
-    except (AuthError, PostCreationError) as e:
-        error_msg = str(e)
+        # Extract LinkedIn token from OAuth proxy
+        access_token = await extract_linkedin_token()
+        if not access_token:
+            raise RuntimeError(
+                "Not authenticated. Please complete the OAuth flow first. "
+                "Your MCP client should prompt you to authenticate."
+            )
+        
+        if not text.strip():
+            raise RuntimeError("Post text cannot be empty")
+        
+        # Validate visibility
+        if visibility not in ["PUBLIC", "CONNECTIONS"]:
+            raise RuntimeError(f"Invalid visibility: {visibility}. Must be PUBLIC or CONNECTIONS")
+        
+        # First, get user info to get the user ID
+        async with httpx.AsyncClient() as client:
+            # Get user ID
+            user_response = await client.get(
+                LINKEDIN_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            
+            if user_response.status_code == 401:
+                raise RuntimeError("Authentication expired. Please re-authenticate.")
+            
+            user_response.raise_for_status()
+            user_data = user_response.json()
+            user_id = user_data.get('sub')
+            
+            if not user_id:
+                raise RuntimeError("Could not get user ID from profile")
+            
+            logger.info(f"Creating post for user: {user_id}")
+            
+            # Build post payload
+            payload = {
+                "author": f"urn:li:person:{user_id}",
+                "lifecycleState": "PUBLISHED",
+                "specificContent": {
+                    "com.linkedin.ugc.ShareContent": {
+                        "shareCommentary": {
+                            "text": text
+                        },
+                        "shareMediaCategory": "NONE"
+                    }
+                },
+                "visibility": {
+                    "com.linkedin.ugc.MemberNetworkVisibility": visibility
+                }
+            }
+            
+            # Create the post
+            headers = get_linkedin_headers(access_token)
+            response = await client.post(
+                LINKEDIN_POST_URL,
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code == 401:
+                raise RuntimeError("Authentication expired. Please re-authenticate.")
+            
+            response.raise_for_status()
+            
+            post_id = response.headers.get("x-restli-id")
+            if not post_id:
+                raise RuntimeError("No post ID returned from LinkedIn")
+            
+            success_msg = f"Successfully created LinkedIn post with ID: {post_id}"
+            logger.info(success_msg)
+            return success_msg
+    
+    except httpx.HTTPStatusError as e:
+        error_text = e.response.text if hasattr(e.response, 'text') else str(e)
+        error_msg = f"HTTP error creating post: {e.response.status_code} - {error_text}"
         logger.error(error_msg)
-        if ctx:
-            ctx.error(error_msg)
         raise RuntimeError(error_msg)
     except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
-        logger.exception("Unexpected error during post creation")
-        if ctx:
-            ctx.error(error_msg)
+        error_msg = f"Failed to create post: {str(e)}"
+        logger.exception(error_msg)
+        raise RuntimeError(error_msg)
+
+
+@mcp.tool()
+async def create_post_with_media(
+    text: str,
+    media_urls: List[str],
+    media_titles: List[str] = None,
+    media_descriptions: List[str] = None,
+    visibility: str = "PUBLIC",
+    ctx: Context = None
+) -> str:
+    """Create a new LinkedIn post with article/link attachments.
+    
+    Note: For image/video uploads, LinkedIn requires a multi-step process
+    involving asset registration and binary upload. This tool supports
+    sharing URLs/articles. For local file uploads, additional implementation
+    is needed.
+
+    Args:
+        text: The content of your post (required)
+        media_urls: List of URLs to share (articles, websites)
+        media_titles: Optional titles for the shared URLs
+        media_descriptions: Optional descriptions for the shared URLs
+        visibility: Post visibility - "PUBLIC" or "CONNECTIONS" (default: PUBLIC)
+
+    Returns:
+        Success message with post ID
+    """
+    logger.info("Creating LinkedIn post with media...")
+    
+    try:
+        # Extract LinkedIn token from OAuth proxy
+        access_token = await extract_linkedin_token()
+        if not access_token:
+            raise RuntimeError(
+                "Not authenticated. Please complete the OAuth flow first. "
+                "Your MCP client should prompt you to authenticate."
+            )
+        
+        if not text.strip():
+            raise RuntimeError("Post text cannot be empty")
+        
+        if not media_urls:
+            raise RuntimeError("At least one media URL is required")
+        
+        # Validate visibility
+        if visibility not in ["PUBLIC", "CONNECTIONS"]:
+            raise RuntimeError(f"Invalid visibility: {visibility}. Must be PUBLIC or CONNECTIONS")
+        
+        async with httpx.AsyncClient() as client:
+            # Get user ID
+            user_response = await client.get(
+                LINKEDIN_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            
+            if user_response.status_code == 401:
+                raise RuntimeError("Authentication expired. Please re-authenticate.")
+            
+            user_response.raise_for_status()
+            user_data = user_response.json()
+            user_id = user_data.get('sub')
+            
+            if not user_id:
+                raise RuntimeError("Could not get user ID from profile")
+            
+            # Build media list
+            media_list = []
+            for i, url in enumerate(media_urls):
+                media_item = {
+                    "status": "READY",
+                    "originalUrl": url,
+                    "title": {
+                        "text": media_titles[i] if media_titles and i < len(media_titles) else f"Link {i + 1}"
+                    },
+                    "description": {
+                        "text": media_descriptions[i] if media_descriptions and i < len(media_descriptions) else ""
+                    }
+                }
+                media_list.append(media_item)
+            
+            # Build post payload
+            payload = {
+                "author": f"urn:li:person:{user_id}",
+                "lifecycleState": "PUBLISHED",
+                "specificContent": {
+                    "com.linkedin.ugc.ShareContent": {
+                        "shareCommentary": {
+                            "text": text
+                        },
+                        "shareMediaCategory": "ARTICLE",
+                        "media": media_list
+                    }
+                },
+                "visibility": {
+                    "com.linkedin.ugc.MemberNetworkVisibility": visibility
+                }
+            }
+            
+            # Create the post
+            headers = get_linkedin_headers(access_token)
+            response = await client.post(
+                LINKEDIN_POST_URL,
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code == 401:
+                raise RuntimeError("Authentication expired. Please re-authenticate.")
+            
+            response.raise_for_status()
+            
+            post_id = response.headers.get("x-restli-id")
+            if not post_id:
+                raise RuntimeError("No post ID returned from LinkedIn")
+            
+            success_msg = f"Successfully created LinkedIn post with media. Post ID: {post_id}"
+            logger.info(success_msg)
+            return success_msg
+    
+    except httpx.HTTPStatusError as e:
+        error_text = e.response.text if hasattr(e.response, 'text') else str(e)
+        error_msg = f"HTTP error creating post: {e.response.status_code} - {error_text}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+    except Exception as e:
+        error_msg = f"Failed to create post with media: {str(e)}"
+        logger.exception(error_msg)
         raise RuntimeError(error_msg)
 
 
 def main():
-    """Main function for running the LinkedIn server."""
-    load_dotenv()
-    logger.info("Starting LinkedIn server...")
-    mcp.run()
+    """Main function for running the LinkedIn MCP server with OAuth Proxy."""
+    print("=" * 60)
+    print(" LinkedIn MCP Server with OAuth Proxy")
+    print("=" * 60)
+    print(f"   Server URL: {SERVER_BASE_URL}")
+    print(f"   OAuth callback: {SERVER_BASE_URL}/auth/callback")
+    print(f"   MCP endpoint: {SERVER_BASE_URL}/mcp")
+    print("\n📋 SETUP REQUIREMENTS:")
+    print("Your LinkedIn OAuth app (developers.linkedin.com) must have:")
+    print(f"  1. Authorized redirect URL: {SERVER_BASE_URL}/auth/callback")
+    print(f"  2. Products enabled: Sign In with LinkedIn using OpenID Connect, Share on LinkedIn")
+    print(f"  3. Scopes granted: {', '.join(settings.LINKEDIN_SCOPES)}")
+    print("\n📋 OAuth Flow (automatic for MCP clients):")
+    print("  1. MCP client (Cursor/Claude) registers dynamically with server")
+    print("  2. Client requests authorization")
+    print("  3. Server redirects to LinkedIn OAuth login page")
+    print("  4. User logs in with LinkedIn credentials")
+    print("  5. LinkedIn returns authorization code")
+    print("  6. Server exchanges code for tokens")
+    print("  7. FastMCP stores tokens (refresh handled automatically)")
+    print("  8. Client uses tokens to access LinkedIn tools")
+    print("\n📡 Connect your MCP client to: " + SERVER_BASE_URL + "/mcp")
+    print("-" * 60)
+    
+    try:
+        logger.info(f"\n🚀 Starting HTTP server on port {PORT}...")
+        logger.info(f"📡 MCP SSE endpoint: {SERVER_BASE_URL}/sse")
+        
+        mcp.run(transport="http", host="0.0.0.0", port=PORT)
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down...")
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

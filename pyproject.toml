@@ -4,22 +4,22 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 linkedin-mcp = "linkedin_mcp.server:main"
+linkedin-mcp-http = "linkedin_mcp.server_http:main"
 
 [project]
 name = "linkedin-mcp"
 authors = [{name = "Filipp Trigub", email = "filipp@trigub.tech"}]
-version = "0.1.7"
-description = "LinkedIn MCP server with auth and posting tools."
+version = "0.2.0"
+description = "LinkedIn MCP server with OAuth proxy authentication and posting tools."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
-    "mcp[cli]>=1.2.0",
+    "fastmcp>=2.12.0",
     "pydantic>=2.10.5",
     "pydantic-settings>=2.7.1",
     "python-dotenv>=1.0.1",
-    "python-jose[cryptography]>=3.3.0",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/linkedin", "src/config"]
+packages = ["linkedin_mcp"]
